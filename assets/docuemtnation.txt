@@ -1,0 +1,245 @@
+# ft\_transcendence Architecture Migration Documentation
+
+## Overview
+
+This document explains the architectural migration of the `ft_transcendence` project from a monolithic Docker Compose setup to a modular, distributed deployment using Azure Virtual Machines (VMs), subnets, and VNet configurations. The infrastructure was fully provisioned using Azure CLI.
+
+---
+
+## 🔁 Migration Summary
+
+*Self-hosted GitHub runners were provisioned on each VM to handle deployments:*
+
+* `jaiye-fronted-runner` for the **Frontend VM**
+* `jaiye-apigateway-runner` for the **API Gateway VM**
+* `jaiye-backend-runner` for the **Backend VM**
+
+- **Original Setup**: Monolithic Docker Compose, all services defined in one file.
+- **New Setup**: Three distinct deployment groups:
+
+  1. **Frontend** (public VM)
+  2. **API Gateway** (private VM)
+  3. **Backend Microservices** (private VM)
+
+Each of these has its own `docker-compose.yml` and `.env` file.
+
+Additionally:
+
+* Integrated Trivy image vulnerability scanning for each deployment stage.
+* Trivy scan reports are emailed to `victordurojaiye2000@gmail.com`.
+* GitHub Actions workflow is split into three independent scan-deploy pipelines based on service changes.
+* Let's Encrypt SSL configured on NGINX in the frontend VM for `https://jaiyelearningdevops.com`
+* Cloudflare WAF used to enforce Geo-IP filtering (blocks UK traffic)
+* GitHub Actions workflow can be split into multiple YAML files triggered on changes to specific folders (`frontend/`, `apigateway/`, `backend/`).
+* Secrets used in GitHub Actions are stored securely in GitHub Secrets:
+
+  * `APIG_ENV_FILE`
+  * `BACK_ENV_FILE`
+  * `EMAIL_PASS`
+  * `EMAIL_USER`
+  * `FRONT_ENV_FILE`
+
+---
+
+## 🩹 Pre-Infrastructure Refactor
+
+Before creating any infrastructure, the first major change was to **refactor the folder structure**:
+
+* A new `backend/` directory was created.
+* All backend services were moved into this `backend/` directory.
+* This separation improved modularity and better aligned with a microservice deployment approach.
+
+### Folder Structure Overview
+
+```
+ft_transcendence/
+├── apigateway/
+│   ├── Dockerfile
+│   ├── docker-compose.yml
+│   └── .env
+├── backend/
+│   ├── authservice/
+│   ├── bucketservice/
+│   ├── friendservice/
+│   ├── gameplayservice/
+│   ├── gameservice/
+│   ├── mailservice/
+│   ├── statusservice/
+│   ├── usermanagement/
+│   ├── docker-compose.yml
+│   └── .env
+├── frontend/
+│   ├── Dockerfile
+│   ├── docker-compose.yml
+│   └── .env
+└── ...
+```
+
+Each of the three major components now has its own **Docker Compose** and **.env** file for independent deployment.
+
+---
+
+## 🧱 Azure Infrastructure Setup
+
+### 1. **Create Resource Group**
+
+```bash
+az group create \
+  --name ft-transcendence-rg \
+  --location eastus
+```
+
+### 2. **Create Virtual Network and Subnets**
+
+```bash
+az network vnet create \
+  --resource-group ft-transcendence-rg \
+  --name ft-vnet \
+  --address-prefix 10.0.0.0/16 \
+  --subnet-name frontend-subnet \
+  --subnet-prefix 10.0.1.0/24
+
+az network vnet subnet create \
+  --resource-group ft-transcendence-rg \
+  --vnet-name ft-vnet \
+  --name apigateway-subnet \
+  --address-prefix 10.0.2.0/24
+
+az network vnet subnet create \
+  --resource-group ft-transcendence-rg \
+  --vnet-name ft-vnet \
+  --name backend-subnet \
+  --address-prefix 10.0.3.0/24
+```
+
+### 3. **Create NAT Gateway for Private Subnets**
+
+```bash
+az network public-ip create \
+  --resource-group ft-transcendence-rg \
+  --name nat-ip \
+  --sku Standard
+
+az network nat gateway create \
+  --resource-group ft-transcendence-rg \
+  --name ft-nat-gateway \
+  --public-ip-addresses nat-ip \
+  --idle-timeout 10
+
+az network vnet subnet update \
+  --resource-group ft-transcendence-rg \
+  --vnet-name ft-vnet \
+  --name apigateway-subnet \
+  --nat-gateway ft-nat-gateway
+
+az network vnet subnet update \
+  --resource-group ft-transcendence-rg \
+  --vnet-name ft-vnet \
+  --name backend-subnet \
+  --nat-gateway ft-nat-gateway
+```
+
+### 4. **Create VMs**
+
+#### Frontend (Public IP: 20.39.33.91)
+
+```bash
+az vm create \
+  --resource-group ft-transcendence-rg \
+  --name frontend-vm \
+  --vnet-name ft-vnet \
+  --subnet frontend-subnet \
+  --public-ip-address frontend-public-ip \
+  --image UbuntuLTS \
+  --admin-username azureuser \
+  --generate-ssh-keys
+```
+
+#### API Gateway (Private IP: 10.0.0.12)
+
+```bash
+az vm create \
+  --resource-group ft-transcendence-rg \
+  --name apigateway-vm \
+  --vnet-name ft-vnet \
+  --subnet apigateway-subnet \
+  --public-ip-address "" \
+  --image UbuntuLTS \
+  --admin-username azureuser \
+  --generate-ssh-keys
+```
+
+#### Backend (Private IP: 10.0.0.20)
+
+```bash
+az vm create \
+  --resource-group ft-transcendence-rg \
+  --name backend-vm \
+  --vnet-name ft-vnet \
+  --subnet backend-subnet \
+  --public-ip-address "" \
+  --image UbuntuLTS \
+  --admin-username azureuser \
+  --generate-ssh-keys
+```
+
+---
+
+## 🔐 Open Required Ports (Using `az vm open-port`)
+
+```bash
+az vm open-port \
+  --resource-group ft-transcendence-rg \
+  --name frontend-vm \
+  --port 80 \
+  --priority 1001
+
+az vm open-port \
+  --resource-group ft-transcendence-rg \
+  --name frontend-vm \
+  --port 443 \
+  --priority 1002
+```
+
+(Repeat similar `az vm open-port` commands for other services on API Gateway and Backend VMs as needed.)
+
+---
+
+## 🛡️ How to Create Azure WAF Rules
+
+1. Navigate to **Azure Portal**.
+2. Go to your **Application Gateway** or **WAF Policy**.
+3. Under "Managed Rules" → Add a **custom rule**:
+
+   * **Name**: Block-UK
+   * **Priority**: 100
+   * **Match Condition**:
+
+     * Match variable: `RemoteAddr`
+     * Operator: `GeoMatch`
+     * Value: `United Kingdom`
+   * **Action**: Block
+
+---
+
+## ⚙️ GitHub Actions & CI/CD Workflow
+
+<Insert full GitHub Actions YAML here>
+
+---
+
+## 💡 Recommendations to Improve Build Time
+
+Here are some best practices and enhancements not yet implemented that could further optimize the CI/CD pipeline:
+
+* **Enable Docker layer caching**: Use a build cache or GitHub cache to avoid rebuilding unchanged layers.
+* **Use slim base images**: Reduce build time and image size by choosing lighter base images like `python:3.11-slim`.
+* **Multi-stage builds**: Clean up development dependencies before final image output.
+* **Configure `.dockerignore`**: Exclude files not needed in the build context (e.g., `.git`, `tests/`, `*.md`).
+* **Split GitHub Actions**: Store scan and deploy logic in separate `.yml` files for each service (`frontend.yml`, `backend.yml`, `apigateway.yml`) and use path-based triggers.
+
+---
+
+## ✅ Conclusion
+
+This migration introduced modularization, cloud infrastructure automation with Azure CLI, and security hardening via Trivy and Cloudflare. It also set the foundation for CI/CD automation through GitHub Actions, enhancing productivity and deployment reliability.
